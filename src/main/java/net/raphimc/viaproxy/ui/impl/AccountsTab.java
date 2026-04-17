@@ -17,6 +17,7 @@
  */
 package net.raphimc.viaproxy.ui.impl;
 
+import com.google.gson.*;
 import net.lenni0451.commons.swing.GBC;
 import net.raphimc.minecraftauth.MinecraftAuth;
 import net.raphimc.minecraftauth.bedrock.BedrockAuthManager;
@@ -25,6 +26,7 @@ import net.raphimc.minecraftauth.msa.model.MsaDeviceCode;
 import net.raphimc.minecraftauth.msa.service.impl.DeviceCodeMsaAuthService;
 import net.raphimc.viabedrock.protocol.data.ProtocolConstants;
 import net.raphimc.viaproxy.ViaProxy;
+import net.raphimc.viaproxy.saves.impl.AccountsSave;
 import net.raphimc.viaproxy.saves.impl.accounts.Account;
 import net.raphimc.viaproxy.saves.impl.accounts.BedrockAccount;
 import net.raphimc.viaproxy.saves.impl.accounts.MicrosoftAccount;
@@ -35,11 +37,14 @@ import net.raphimc.viaproxy.ui.popups.AddAccountPopup;
 import net.raphimc.viaproxy.util.TFunction;
 
 import javax.swing.*;
+import javax.swing.filechooser.FileNameExtensionFilter;
 import java.awt.*;
 import java.awt.event.KeyAdapter;
 import java.awt.event.KeyEvent;
 import java.awt.event.MouseAdapter;
 import java.awt.event.MouseEvent;
+import java.io.*;
+import java.util.List;
 import java.util.concurrent.TimeoutException;
 import java.util.function.Consumer;
 
@@ -73,11 +78,13 @@ public class AccountsTab extends UITab {
             JScrollPane scrollPane = new JScrollPane();
             DefaultListModel<Account> model = new DefaultListModel<>();
             this.accountsList = new JList<>(model);
+            this.accountsList.setSelectionMode(ListSelectionModel.MULTIPLE_INTERVAL_SELECTION);
             this.accountsList.addMouseListener(new MouseAdapter() {
                 public void mousePressed(MouseEvent e) {
                     if (SwingUtilities.isRightMouseButton(e)) {
                         int row = AccountsTab.this.accountsList.locationToIndex(e.getPoint());
-                        AccountsTab.this.accountsList.setSelectedIndex(row);
+                        if (!accountsList.isSelectedIndex(row))
+                            AccountsTab.this.accountsList.setSelectedIndex(row);
                     } else if (e.getClickCount() == 2) {
                         int index = AccountsTab.this.accountsList.getSelectedIndex();
                         if (index != -1) AccountsTab.this.markSelected(index);
@@ -89,11 +96,20 @@ public class AccountsTab extends UITab {
                 public void keyPressed(KeyEvent e) {
                     int index = AccountsTab.this.accountsList.getSelectedIndex();
                     if (index == -1) return;
-                    if (e.getKeyCode() == KeyEvent.VK_UP) {
+
+                    boolean ctrl = (e.getModifiersEx() & KeyEvent.CTRL_DOWN_MASK) != 0;
+
+                    if (e.getKeyCode() == KeyEvent.VK_UP && ctrl) {
                         AccountsTab.this.moveUp(index);
                         e.consume();
-                    } else if (e.getKeyCode() == KeyEvent.VK_DOWN) {
+                    } else if (e.getKeyCode() == KeyEvent.VK_DOWN && ctrl) {
                         AccountsTab.this.moveDown(index);
+                        e.consume();
+                    } else if (e.getKeyCode() == KeyEvent.VK_ENTER) {
+                        AccountsTab.this.markSelected(index);
+                        e.consume();
+                    } else if (e.getKeyCode() == KeyEvent.VK_DELETE) {
+                        removeSelected();
                         e.consume();
                     }
                 }
@@ -123,20 +139,7 @@ public class AccountsTab extends UITab {
             }
             {
                 JMenuItem removeItem = new JMenuItem(I18n.get("tab.accounts.list.context_menu.remove"));
-                removeItem.addActionListener(event -> {
-                    int index = this.accountsList.getSelectedIndex();
-                    if (index != -1) {
-                        Account removed = model.remove(index);
-                        ViaProxy.getSaveManager().accountsSave.removeAccount(removed);
-                        ViaProxy.getSaveManager().save();
-                        if (ViaProxy.getConfig().getAccount() == removed) {
-                            if (model.isEmpty()) this.markSelected(-1);
-                            else this.markSelected(0);
-                        }
-                    }
-                    if (index < model.getSize()) this.accountsList.setSelectedIndex(index);
-                    else if (index > 0) this.accountsList.setSelectedIndex(index - 1);
-                });
+                removeItem.addActionListener(event -> removeSelected());
                 contextMenu.add(removeItem);
             }
             {
@@ -154,6 +157,69 @@ public class AccountsTab extends UITab {
                     if (index != -1) this.moveDown(index);
                 });
                 contextMenu.add(moveDown);
+            }
+            {
+                JMenuItem importItem = new JMenuItem(I18n.get("tab.accounts.list.context_menu.import"));
+                importItem.addActionListener(event -> {
+                    JFileChooser chooser = new JFileChooser();
+                    chooser.setFileSelectionMode(JFileChooser.FILES_ONLY);
+                    chooser.setFileFilter(new FileNameExtensionFilter("JSON files (*.json)", "json"));
+                    chooser.setAcceptAllFileFilterUsed(false);
+                    if (chooser.showOpenDialog(this.viaProxyWindow) == JFileChooser.APPROVE_OPTION) {
+                        File file = chooser.getSelectedFile();
+                        if (!file.getName().toLowerCase().endsWith(".json"))
+                            return;
+
+                        try (Reader reader = new FileReader(file)) {
+                            JsonElement element = JsonParser.parseReader(reader);
+                            if (!element.isJsonArray())
+                                throw new IllegalStateException("Invalid file (expected JSON array)");
+
+                            List<AccountsSave.Entry> loadedEntries = ViaProxy.getSaveManager().accountsSave.loadFromJsonArray(element.getAsJsonArray());
+                            for (AccountsSave.Entry entry : loadedEntries) {
+                                ViaProxy.getSaveManager().accountsSave.addEntry(entry);
+
+                                if (entry instanceof AccountsSave.KnownEntry knownEntry)
+                                    this.addAccount(knownEntry.account());
+                            }
+
+                            ViaProxy.getSaveManager().save();
+                        } catch (IOException ex) {
+                            ViaProxyWindow.showException(ex);
+                        }
+                    }
+                });
+
+                JMenuItem exportItem = new JMenuItem(I18n.get("tab.accounts.list.context_menu.export"));
+                exportItem.addActionListener(event -> {
+                    List<Account> selected = this.accountsList.getSelectedValuesList();
+                    if (selected.isEmpty()) return;
+
+                    JFileChooser chooser = new JFileChooser();
+                    chooser.setSelectedFile(new File("viaproxy_accounts.json"));
+                    if (chooser.showSaveDialog(this.viaProxyWindow) == JFileChooser.APPROVE_OPTION) {
+                        File file = chooser.getSelectedFile();
+
+                        try (Writer writer = new FileWriter(file)) {
+                            Gson gson = new GsonBuilder().setPrettyPrinting().create();
+
+                            JsonArray array = new JsonArray();
+                            for (Account account : selected) {
+                                JsonObject json = account.toJson();
+                                json.addProperty("accountType", account.getClass().getName());
+                                array.add(json);
+                            }
+
+                            gson.toJson(array, writer);
+                        } catch (IOException ex) {
+                            ViaProxyWindow.showException(ex);
+                        }
+                    }
+                });
+
+                contextMenu.addSeparator();
+                contextMenu.add(importItem);
+                contextMenu.add(exportItem);
             }
             this.accountsList.setComponentPopupMenu(contextMenu);
             GBC.create(body).grid(0, gridy++).weight(1, 1).insets(BODY_BLOCK_PADDING, BORDER_PADDING, 0, BORDER_PADDING).fill(GBC.BOTH).add(scrollPane);
@@ -295,4 +361,42 @@ public class AccountsTab extends UITab {
         this.addThread.start();
     }
 
+    private void removeSelected() {
+        List<Account> selected = this.accountsList.getSelectedValuesList();
+        if (selected.isEmpty()) return;
+
+        DefaultListModel<String> previewModel = new DefaultListModel<>();
+        selected.forEach(account -> previewModel.addElement(account.getDisplayString()));
+
+        JList<String> previewList = new JList<>(previewModel);
+        previewList.setEnabled(true);
+        previewList.setVisibleRowCount(Math.min(10, previewModel.size()));
+
+        JScrollPane scrollPane = new JScrollPane(previewList);
+        scrollPane.setPreferredSize(new Dimension(300, 150));
+
+        JPanel panel = new JPanel(new BorderLayout(0, 10));
+        panel.add(new JLabel(I18n.get("tab.accounts.confirm_delete", String.valueOf(previewModel.size()))), BorderLayout.NORTH);
+        panel.add(scrollPane, BorderLayout.CENTER);
+
+        if (JOptionPane.showConfirmDialog(this.viaProxyWindow, panel, I18n.get("tab.accounts.confirm_delete.title"), JOptionPane.YES_NO_OPTION, JOptionPane.WARNING_MESSAGE) != JOptionPane.YES_OPTION)
+            return;
+
+        DefaultListModel<Account> model1 = (DefaultListModel<Account>) this.accountsList.getModel();
+        for (Account account : selected) {
+            model1.removeElement(account);
+            ViaProxy.getSaveManager().accountsSave.removeAccount(account);
+
+            if (ViaProxy.getConfig().getAccount() == account)
+                this.markSelected(-1);
+        }
+
+        ViaProxy.getSaveManager().save();
+
+        if (!model1.isEmpty()) {
+            this.accountsList.setSelectedIndex(0);
+        } else {
+            this.accountsList.setSelectedIndex(-1);
+        }
+    }
 }
